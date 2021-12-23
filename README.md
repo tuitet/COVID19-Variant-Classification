@@ -1,6 +1,7 @@
 # COVID19-Variant-Classification
 
 ## Abstract
+
 Classifying Covid-19 Variant as Original or Delta based on underlying medical and demographic information.
 
 Coronavirus variants have proven difficult to contain and costly to genetically analyze. This prohibitive
@@ -32,6 +33,7 @@ inform targeted public messaging, but would have to be one tool among many for i
 decisions.
 
 ## Lessons Learned
+
 There were several skills I wanted to explore, and thus why I chose this dataset. This project tested several
 key data mining and statistical learning skills, including:  
 ▪ I wanted to analyze an interesting healthcare dataset. This COVID-19 dataset was not my first
@@ -58,4 +60,4 @@ Gradient Boosting, Multilayer Perceptron Network).
 ▪ I wanted to perform hyperparameter tuning on many different models, to understand the
 diversity of hyperparameter options across models.  
 ▪ I wanted to practice my written communication skills, presenting technical data mining results to
-a non-technical audience.  
+a non-technical audience.
