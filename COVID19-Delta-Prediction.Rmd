@@ -1,0 +1,1041 @@
+---
+title: "COVID19-Variant-Prediction-Project"
+author: "Tim T"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output: 
+  html_document:
+
+    css: css_RMD_styles.css
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+#https://stackoverflow.com/questions/33969024/install-packages-fails-in-knitr-document-trying-to-use-cran-without-setting-a
+r = getOption("repos")
+r["CRAN"] = "http://cran.us.r-project.org"
+options(repos = r)
+
+library(knitr)
+knitr::opts_chunk$set(fig.align = 'center', out.width = '80%', echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+library(data.table)
+library(fasttime)
+library(vroom)
+library(tidyverse)
+library(broom)
+library(caret)
+library(readr)
+library(mice)
+library(VIM)
+library(miceFast)
+library(lattice)
+library(collapse)
+library(randomForest)
+library(gbm)
+library(pROC)
+library(naivebayes)
+library(xgboost)
+library(Rborist)
+library(RSNNS)
+# if(require("RSNNS")) remove.packages('RSNNS')
+
+```
+
+## Import Data
+
+```{r import data, warning=FALSE}
+
+#load in the full data
+covid <- vroom("COVID-19_Case_Surveillance_Public_Use_Data.csv", 
+               col_types = list(
+                 cdc_case_earliest_dt = "D",
+                 current_status = "f",
+                 sex = "f",
+                 age_group = "f",
+                 race_ethnicity_combined = "f",
+                 hosp_yn = "f",
+                 icu_yn = "f",
+                 death_yn = "f",
+                 medcond_yn = "f"),
+               col_select = list(
+                 cdc_case_earliest_dt, 
+                 current_status, 
+                 sex, 
+                 age_group, 
+                 race_eth = race_ethnicity_combined, 
+                 hosp_yn, 
+                 icu_yn, 
+                 death_yn, 
+                 med_yn = medcond_yn)
+)
+
+str(covid)
+
+set.seed(321)
+
+```
+
+## Exploratory Data Analysis
+
+### Analyze date distribution:
+
+```{r Plot Date Count}
+
+#https://stackoverflow.com/questions/5388832/how-to-get-a-vertical-geom-vline-to-an-x-axis-of-class-date
+
+#plot covid cases over time
+covid %>% ggplot(aes(x=cdc_case_earliest_dt, fill = "red")) +
+  geom_histogram(bins = 50) + 
+  geom_vline(xintercept = as.numeric(as.Date(c("2020-09-30", "2021-08-01"))), linetype = 4, color = "black") + 
+  ggtitle("COVID-19 USA Positive Tests: Jan 2020 - Sept 2021") +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = .5))
+
+#plot covid by age group
+covid %>% ggplot(aes(x=cdc_case_earliest_dt, fill = "red")) +
+  geom_histogram(bins = 50) + 
+  facet_wrap(~age_group) +
+  ggtitle("COVID-19 USA Positive Tests by Age: Jan 2020 - Sept 2021") +
+  theme(legend.position = "none") +
+  theme(plot.title = element_text(hjust = .5))
+
+
+```
+
+### Add Delta Variable
+
+For Delta, We'll keep data since 8/1/2021, since that is when Delta was 95% of cases reported. Using 95% as a threshold where we can confidently say the data represents Delta symptoms.
+
+For the original covid strain, we'll keep data prior to 9/30/2020, since that is before the Alpha variant arrived (i.e. the original variant was the primary variant).
+
+```{r Add Delta, warning=FALSE}
+
+#create the delta dataset
+covid_delta <- as.data.table(covid %>%
+  filter(cdc_case_earliest_dt >= "2021-08-01") %>%
+  arrange(desc(cdc_case_earliest_dt)))
+
+#indicator that this is delta
+covid_delta$delta <- 1
+
+#create the original wild variant dataset
+covid_wild <- as.data.table(covid %>%
+  filter(cdc_case_earliest_dt <= "2020-09-30") %>%
+  arrange(desc(cdc_case_earliest_dt)))
+
+#indicator that this is not delta
+covid_wild$delta <- 0
+
+#remove full covid dataset to free up space
+rm(covid)
+invisible(gc())
+
+#combine wild/delta into 1 dataset, which we'll use for analysis
+covid_wild_delta <- rbindlist(list(covid_delta, covid_wild))
+covid_wild_delta$delta <- as.factor(covid_wild_delta$delta)
+
+#check if the 2 are equal...they are with the only exception the delta column being a double in the old data and factor in the new data, which is known/ok
+all_equal(bind_rows(covid_wild, covid_delta), covid_wild_delta)
+
+rm(covid_delta, covid_wild) 
+invisible(gc())
+
+#for analysis purposes, we'll take a sample of the dataset for now
+covid_wild_delta_1perc <- covid_wild_delta %>% slice_sample(prop = .01)
+  
+#see the counts of each factor's values
+summary(covid_wild_delta_1perc)
+
+#plot distribution of variants
+covid_wild_delta_1perc %>% 
+  ggplot(aes(x = delta, fill = delta)) + 
+  geom_bar(aes(y = (..count..)/sum(..count..))) +
+  scale_y_continuous(labels = scales::percent) +
+  ylab('Proportion of Variant') +
+  xlab("Non-Delta vs. Delta") +
+  ggtitle('Non-Delta vs. Delta Percentage Breakdown') +
+  theme(plot.title = element_text(hjust = .5))
+
+
+#count the proportion of delta vs. non-delta
+sum(covid_wild_delta_1perc$delta == '0')/nrow(covid_wild_delta_1perc)
+sum(covid_wild_delta_1perc$delta == '1')/nrow(covid_wild_delta_1perc)
+  
+#remove covid wild delta (10M observations) to save space
+rm(covid_wild_delta) 
+invisible(gc())
+```
+
+### Replace Missing/Unknown with NA
+
+For this analysis, where the value is missing or unknown, we will replace with NA.
+
+```{r convert values to NA}
+
+#change missing and unknown to NA's
+covid_wild_delta_1perc$sex[covid_wild_delta_1perc$sex == "Missing" | covid_wild_delta_1perc$sex == "Unknown"] <- NA
+
+covid_wild_delta_1perc$age_group[covid_wild_delta_1perc$age_group == "Missing" | covid_wild_delta_1perc$age_group == "Unknown"] <- NA
+
+covid_wild_delta_1perc$race_eth[covid_wild_delta_1perc$race_eth == "Missing" | covid_wild_delta_1perc$race_eth == "Unknown"] <- NA
+
+covid_wild_delta_1perc$hosp_yn[covid_wild_delta_1perc$hosp_yn == "Missing" | covid_wild_delta_1perc$hosp_yn == "Unknown"] <- NA
+
+covid_wild_delta_1perc$icu_yn[covid_wild_delta_1perc$icu_yn == "Missing" | covid_wild_delta_1perc$icu_yn == "Unknown" | covid_wild_delta_1perc$icu_yn == "nul"] <- NA
+
+covid_wild_delta_1perc$death_yn[covid_wild_delta_1perc$death_yn == "Missing" | covid_wild_delta_1perc$death_yn == "Unknown"] <- NA
+
+covid_wild_delta_1perc$med_yn[covid_wild_delta_1perc$med_yn == "Missing" | covid_wild_delta_1perc$med_yn == "Unknown"] <- NA
+
+covid_wild_delta_1perc <- droplevels(covid_wild_delta_1perc)
+
+#show summary, no more Unknown/Missing values, converted to NA's
+summary(covid_wild_delta_1perc)
+
+```
+
+### Impute Missing Values
+
+We will use multiple imputation techniques to replace NA's with imputed values.
+
+```{r Impute Missing Values, warnings = FALSE}
+
+
+# https://cran.r-project.org/web/packages/miceFast/vignettes/miceFast-intro.html
+# https://cran.rstudio.com/web/packages/miceFast/miceFast.pdf
+# --> https://rdrr.io/cran/miceFast/man/fill_NA.html
+# https://github.com/Polkas/miceFast
+# https://support.sas.com/resources/papers/proceedings/proceedings/sugi30/113-30.pdf
+# https://cran.r-project.org/web/packages/miceFast/vignettes/miceFast-intro.html
+# https://stackoverflow.com/questions/20947908/imputation-mice-in-r-still-na-left-in-dataset
+# https://stefvanbuuren.name/fimd/sec-modelform.html
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4082461/
+# https://www.kdnuggets.com/2017/09/missing-data-imputation-using-r.html
+# https://www.kdnuggets.com/2020/09/missing-value-imputation-review.html
+
+#visualize/understand which variables are most missing
+aggr(covid_wild_delta_1perc[,c(3:9)], col = mdc(1:2), numbers = TRUE, sortVars = TRUE, labels = names(covid_wild_delta_1perc[,c(3:9)]), cex.axis = .7, gap = 3, ylab = c("Proportion of missingness", "Missingness pattern"))
+
+#visualize missing data, and combinations of missing data, see icu_yn is the most, and what it's connected to
+upset_NA(covid_wild_delta_1perc)
+
+#count proportion of complete rows in the dataset pre-imputation
+nrow(covid_wild_delta_1perc[complete.cases(covid_wild_delta_1perc),])/nrow(covid_wild_delta_1perc)
+
+#use data table, add imputation column to predict sex...using all variables has many NA's...keep it to just age_group and race_ethnicity_combined to predict sex
+#try 3 different models, and take the modal value as the true value
+#do the same for other variables...
+
+## IMPUTE SEX
+covid_wild_delta_1perc[, sex_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 3,
+  posit_x = c(4:5)
+)] %>%
+  .[, sex_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 3,
+    posit_x = c(4:5),
+    k = 5
+  )] %>%
+  .[, sex_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 3,
+    posit_x = c(4:5),
+    k = 5
+  )] %>%
+  .[, sex_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = sex_imp1:sex_imp3]
+
+
+#check a sample of results where sex is NA and sex_imp is populated...only 2 rows had enough data to impute...
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,sex]) & !is.na(covid_wild_delta_1perc[,sex_imp1]))[1:6],]
+
+#plot the distribution of imputations vs Distribution of initial data? but this doesn't align with pre vs. post imputation count of NA's (1077 vs. 802 NA's) as per the summary below??? 
+# compare_imp(covid_wild_delta_1perc, origin = "sex", target = c("sex_imp1", "sex_imp2", "sex_imp3", "sex_imp_mix"))
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('sex_imp1', 'sex_imp2', 'sex_imp3') := NULL]
+
+
+################
+
+## IMPUTE AGE GROUP
+#maybe copy same methods as above, but change y and x...use mixed value to predict this?
+covid_wild_delta_1perc[, age_group_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 4,
+  posit_x = c(3, 11, 5)
+)] %>%
+  .[, age_group_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 4,
+    posit_x = c(3, 11, 5),
+    k = 5
+  )] %>%
+  .[, age_group_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 4,
+    posit_x = c(3, 11, 5),
+    k = 5
+  )] %>%
+  .[, age_group_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = age_group_imp1:age_group_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,age_group]) & !is.na(covid_wild_delta_1perc[,age_group_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('age_group_imp1', 'age_group_imp2', 'age_group_imp3') := NULL]
+
+
+######################
+
+## IMPUTE RACE/ETHNICITY
+#copy same methods as above, but change y and x...use mixed value to predict this
+covid_wild_delta_1perc[, race_ethnicity_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 5,
+  posit_x = c(3, 11, 4, 12)
+)] %>%
+  .[, race_ethnicity_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 5,
+    posit_x = c(3, 11, 4, 12),
+    k = 5
+  )] %>%
+  .[, race_ethnicity_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 5,
+    posit_x = c(3, 11, 4, 12),
+    k = 5
+  )] %>%
+  .[, race_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = race_ethnicity_imp1:race_ethnicity_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,race_eth]) & !is.na(covid_wild_delta_1perc[,race_ethnicity_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('race_ethnicity_imp1', 'race_ethnicity_imp2', 'race_ethnicity_imp3') := NULL]
+
+
+###################
+
+#IMPUTE HOSP_YN
+covid_wild_delta_1perc[, hosp_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 6,
+  posit_x = c(11, 12, 13)
+)] %>%
+  .[, hosp_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 6,
+    posit_x = c(11, 12, 13),
+    k = 5
+  )] %>%
+  .[, hosp_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 6,
+    posit_x = c(11, 12, 13),
+    k = 5
+  )] %>%
+  .[, hosp_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = hosp_imp1:hosp_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,hosp_yn]) & !is.na(covid_wild_delta_1perc[,hosp_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('hosp_imp1', 'hosp_imp2', 'hosp_imp3') := NULL]
+
+
+#######################
+
+#IMPUTE ICU_YN
+covid_wild_delta_1perc[, icu_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 7,
+  posit_x = c(11, 12, 13, 14)
+)] %>%
+  .[, icu_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 7,
+    posit_x = c(11, 12, 13, 14),
+    k = 5
+  )] %>%
+  .[, icu_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 7,
+    posit_x = c(11, 12, 13, 14),
+    k = 5
+  )] %>%
+  .[, icu_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = icu_imp1:icu_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,icu_yn]) & !is.na(covid_wild_delta_1perc[,icu_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('icu_imp1', 'icu_imp2', 'icu_imp3') := NULL]
+
+
+#######################
+
+#IMPUTE death_YN
+covid_wild_delta_1perc[, death_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 8,
+  posit_x = c(11, 12, 13, 14, 15)
+)] %>%
+  .[, death_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 8,
+    posit_x = c(11, 12, 13, 14, 15),
+    k = 5
+  )] %>%
+  .[, death_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 8,
+    posit_x = c(11, 12, 13, 14, 15),
+    k = 5
+  )] %>%
+  .[, death_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = death_imp1:death_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,death_yn]) & !is.na(covid_wild_delta_1perc[,death_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('death_imp1', 'death_imp2', 'death_imp3') := NULL]
+
+
+
+#######################
+
+#IMPUTE medcond_YN
+covid_wild_delta_1perc[, medcond_imp1 := fill_NA(
+  x = .SD,
+  model = "lda",
+  posit_y = 9,
+  posit_x = c(11, 12, 13, 14, 15,16)
+)] %>%
+  .[, medcond_imp2 := fill_NA_N(
+    x = .SD,
+    model = "pmm",
+    posit_y = 9,
+    posit_x = c(11, 12, 13, 14, 15,16),
+    k = 5
+  )] %>%
+  .[, medcond_imp3 := fill_NA_N(
+    x = .SD,
+    model = "lm_bayes",
+    posit_y = 9,
+    posit_x = c(11, 12, 13, 14, 15,16),
+    k = 5
+  )] %>%
+  .[, med_imp_mix := as.factor(apply(.SD, 1, fmode)), .SDcols = medcond_imp1:medcond_imp3]
+#check a sample of results where original is NA and imputed is populated
+covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,med_yn]) & !is.na(covid_wild_delta_1perc[,medcond_imp1]))[1:5],]
+
+#remove the temporary 1-3 estimates to save space
+covid_wild_delta_1perc[,c('medcond_imp1', 'medcond_imp2', 'medcond_imp3') := NULL]
+
+#check post-imputation summary now
+summary(covid_wild_delta_1perc)
+
+
+```
+
+### Post-Imputation Data Checks
+
+Check post-imputation results, to compare with the pre-imputation results.
+
+```{r post-imputation data checks}
+
+#re-run after imputation, see the new data...*mix variables all have low missingness...around 1%
+aggr(covid_wild_delta_1perc[,c(11:17)], col = mdc(1:2), numbers = TRUE, sortVars = TRUE, labels = names(covid_wild_delta_1perc[,c(11:17)]), cex.axis = .5, gap = 3, ylab = c("Proportion of missingness", "Missingness pattern"))
+
+#count proportion of complete rows in the dataset post-imputation
+nrow(covid_wild_delta_1perc[complete.cases(covid_wild_delta_1perc),])/nrow(covid_wild_delta_1perc)
+
+
+#remove unused factors
+covid_wild_delta_1perc <- droplevels(covid_wild_delta_1perc)
+
+#keep the non-imputed columns.
+covid_wild_delta_1perc_nonimpute <- covid_wild_delta_1perc[,3:10]
+
+#check proportion of NA's in each non-imputed column
+tidy(colMeans(is.na(covid_wild_delta_1perc_nonimpute))) %>% rename(variable = names, prop_missing = x)
+
+
+#keep the imputed columns. Note we put the response delta column at the end to be consistent
+covid_wild_delta_1perc_impute <- covid_wild_delta_1perc[,c(11:17, 10)]
+
+#check proportion of NA's in each column in imputed columns
+tidy(colMeans(is.na(covid_wild_delta_1perc_impute))) %>% rename(variable = names, prop_missing = x)
+
+
+#remove remaining NA values after imputing 
+#Finally, we will remove rows with any NA's, as this will be necessary for later models, and we've done a large amount of imputing.
+covid_wild_delta_1perc_impute <- na.omit(covid_wild_delta_1perc_impute)
+#confirm there are no NA's left, no cases where there's not a complete row
+nrow(covid_wild_delta_1perc_impute[!complete.cases(covid_wild_delta_1perc_impute),])
+
+
+```
+
+## Split Train/Test Set
+
+Split updated dataset into training and testing dataset for model training and testing.
+
+```{r split train, test}
+
+#https://www.machinelearningplus.com/machine-learning/caret-package/
+#split the data into 75% train, 25% test
+train_index <- createDataPartition(covid_wild_delta_1perc_impute$delta, p = .75, list = FALSE, times = 1)
+covid_train_imputed <- covid_wild_delta_1perc_impute[train_index,]
+covid_test_imputed <- covid_wild_delta_1perc_impute[-train_index,]
+
+#setup df to store predictions and errors for each model
+prediction_error_df <- data.frame(covid_test_imputed$delta)
+
+#see summary of training data
+summary(covid_train_imputed)
+
+
+```
+
+### Simple EDA on imputed training data
+
+```{r EDA Plots, warning=FALSE}
+
+#plot distribution of Delta
+covid_train_imputed %>% ggplot(aes(x=delta, fill = delta)) + geom_histogram(stat = "count")
+
+
+#count the proportion of non-delta vs. delta
+#non-delta proportion
+sum(covid_train_imputed$delta == 0)/nrow(covid_train_imputed)
+#delta proportion
+sum(covid_train_imputed$delta == 1)/nrow(covid_train_imputed)
+
+# #melt the data, converting columns to rows
+# library(reshape2)
+# covid_train_melt <- melt(covid_train_imputed, id.var = "delta")
+# 
+# #create a boxplot of each variable split by delta = 0 or 1
+# covid_train_melt %>% ggplot(aes(x=variable, y=value)) + 
+#   geom_boxplot(aes(color = delta)) +
+#   facet_wrap(~variable, scales = "free") +
+#   ylab("Variable Value") + ggtitle("Boxplot of Variable vs. Delta by non-Delta vs. Delta")
+
+#count unique observations (752) / total number of observations to get the percentage of unique observations (0.0098)
+nrow(covid_train_imputed[,1:7] %>% group_by_all %>% count)/nrow(covid_train_imputed)
+
+
+```
+
+## Fit and Test Models
+
+### Train Control Setup
+
+Setup default training method for all models (5-fold Cross-Validation)
+```{r traincontrol}
+#setup master train control, 5-fold CV, getting probabilities and saving predictions for ROC
+fitControl <- trainControl(## 5-fold CV
+                           method = "cv",
+                           number = 5,
+                           savePredictions = TRUE)
+```
+
+### Logistic Regression
+
+```{r Logistic Regression}
+
+#https://machinelearningmastery.com/hyperparameters-for-classification-machine-learning-algorithms/
+  
+#fit logistic regression model on variables 3-9...the date is too strong of a predictor because delta vs. non-delta is split by dates in our dataset creation 
+logistic_reg_glm_imputed <- glm(delta ~ ., data = covid_train_imputed, family = binomial)
+
+#use the model to predict mpg01 classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  logistic_reg_pred_imputed = as.factor(ifelse(predict(logistic_reg_glm_imputed, covid_test_imputed[,1:7], type = "response") > .5, 1, 0)),
+  logistic_reg_error_imputed = (logistic_reg_pred_imputed != covid_test_imputed$delta)
+)
+#calculate the average test error for this model 
+mean(prediction_error_df$logistic_reg_error_imputed, na.rm = TRUE)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  prediction_error_df$logistic_reg_pred_imputed,  
+  covid_test_imputed$delta)
+
+#create ROC curve...https://rviews.rstudio.com/2019/03/01/some-r-packages-for-roc-curves/
+logreg_proc <- roc(response = as.numeric(prediction_error_df$logistic_reg_pred_imputed), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+
+#add accuracy, sensitivity, specificity of this model to a summary tibble
+summary_statistics <- tibble(
+  model = 'Logistic_Regression',
+  accuracy = caret::confusionMatrix(prediction_error_df$logistic_reg_pred_imputed, covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(prediction_error_df$logistic_reg_pred_imputed, covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(prediction_error_df$logistic_reg_pred_imputed, covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(logreg_proc)) 
+  )
+  
+#
+varImp(logistic_reg_glm_imputed) %>% arrange(desc(Overall))
+
+```
+
+### Naive Bayes
+
+```{r Naive Bayes}
+
+#train the naive bayes model. there are several hyperparameters, and it's not clear what values would make sense to train across, so just setting tunelength to 5
+nb_caret <- caret::train(delta ~ .,
+                  data = covid_train_imputed,
+                  method="naive_bayes",
+                  metric = "Accuracy",
+                  trControl = fitControl,
+                  tuneLength = 5)
+
+#show some key output
+nb_caret$bestTune
+plot(nb_caret)
+plot(varImp(nb_caret))
+
+#use the model to predict delta classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  nb_pred = predict(nb_caret, covid_test_imputed[,1:7], type = "raw"),
+  nb_error = (nb_pred != covid_test_imputed$delta)
+)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  prediction_error_df$nb_pred,  
+  covid_test_imputed$delta)
+
+#create ROC curve...https://rviews.rstudio.com/2019/03/01/some-r-packages-for-roc-curves/
+nb_proc <- roc(response = as.numeric(prediction_error_df$nb_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Naive_Bayes',
+  accuracy = caret::confusionMatrix(prediction_error_df$nb_pred, covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(prediction_error_df$nb_pred, covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(prediction_error_df$nb_pred, covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(nb_proc)))
+
+
+```
+
+### Random Forest
+
+```{r Random Forest}
+
+#train the model
+rf_caret <- caret::train(x = covid_train_imputed[,1:7],
+                  y = as.factor(covid_train_imputed$delta),
+                  method="Rborist",
+                  metric = "Accuracy",
+                  trControl = fitControl,
+                  tuneGrid = expand.grid(predFixed = 1:5,
+                                         minNode = c(10, 100, 1000)
+                                         ))
+
+#show some key output
+rf_caret$bestTune
+plot(rf_caret)
+plot(varImp(rf_caret))
+
+
+#use the model to predict delta classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  rf_pred = predict(rf_caret, covid_test_imputed[,1:7], type = "raw"),
+  rf_error = (rf_pred != covid_test_imputed$delta)
+)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  prediction_error_df$rf_pred,  
+  covid_test_imputed$delta)
+
+
+#create ROC curve...https://rviews.rstudio.com/2019/03/01/some-r-packages-for-roc-curves/
+rf_proc <- roc(response = as.numeric(prediction_error_df$rf_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Random_Forest',
+  accuracy = caret::confusionMatrix(prediction_error_df$rf_pred, covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(prediction_error_df$rf_pred, covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(prediction_error_df$rf_pred, covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(rf_proc)))
+
+
+```
+
+### Stochastic Gradient Boosting (GBM)
+
+```{r Boosting}
+
+# fit gradient boosting model...for some reason, gbm has issue with factor response, so converted to character https://stackoverflow.com/questions/21198007/gbm-model-generating-na-results
+#https://cran.r-project.org/web/packages/xgboost/vignettes/discoverYourData.html
+gbm_caret <- caret::train(x = covid_train_imputed[,1:7],
+                  y = as.factor(covid_train_imputed$delta),
+                  method="gbm",
+                  metric = "Accuracy",
+                  trControl = fitControl,
+                  tuneLength = 3,
+                  verbose = FALSE)
+
+#check key information on models
+gbm_caret$bestTune
+plot(gbm_caret)
+plot(varImp(gbm_caret))
+
+
+## Make Prediction
+#use the model to predict delta, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  gbm_pred = predict(gbm_caret, covid_test_imputed[,1:7]),
+  gbm_error = (gbm_pred != covid_test_imputed$delta)
+)
+
+# You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  as.factor(prediction_error_df$gbm_pred),  
+  covid_test_imputed$delta)
+
+#create ROC curve
+gbm_proc <- roc(response = as.numeric(prediction_error_df$gbm_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Stochastic_Gradient_Boosting',
+  accuracy = caret::confusionMatrix(as.factor(prediction_error_df$gbm_pred), covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(as.factor(prediction_error_df$gbm_pred), covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(as.factor(prediction_error_df$gbm_pred), covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(gbm_proc)))
+
+```
+
+### Extreme Gradient Boosting DART (XGBoost)
+
+```{r XGBoost, message=FALSE, warning=FALSE}
+
+#https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/
+#https://www.kaggle.com/pelkoja/visual-xgboost-tuning-with-caret
+#https://cran.r-project.org/web/packages/xgboost/vignettes/discoverYourData.html#understand-your-dataset-with-xgboost
+# xgb_train_control <- trainControl(
+#   method = "cv",
+#   number = 2
+# )
+
+#fit xgboost
+xgb_caret <- caret::train(delta ~ ., 
+                   data = covid_train_imputed, 
+                   method = "xgbDART",
+                   trControl = fitControl,
+                   tuneLength = 2)
+
+#https://stats.stackexchange.com/questions/88793/interpret-variable-importance-varimp-for-factor-variables
+#https://stackoverflow.com/questions/22200923/different-results-with-formula-and-non-formula-for-caret-training
+xgb_caret$bestTune
+plot(varImp(xgb_caret))
+#has to be numeric http://appliedpredictivemodeling.com/blog/2013/10/23/the-basics-of-encoding-categorical-data-for-predictive-models
+#encoded_matrix <- model.matrix(covid_train_imputed)
+
+
+## Make Prediction
+#use the model to predict mpg01 classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  xgb_pred = predict(xgb_caret, covid_test_imputed[,1:7]),
+  xgb_error = (xgb_pred != covid_test_imputed$delta)
+)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  as.factor(prediction_error_df$xgb_pred),  
+  covid_test_imputed$delta)
+
+#create ROC curve
+xgb_proc <- roc(response = as.numeric(prediction_error_df$xgb_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Extreme_Gradient_Boosting',
+  accuracy = caret::confusionMatrix(as.factor(prediction_error_df$xgb_pred), covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(as.factor(prediction_error_df$xgb_pred), covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(as.factor(prediction_error_df$xgb_pred), covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(xgb_proc)))
+
+
+```
+
+### Single Layer Neural Network
+
+```{r neural network, message=FALSE, warning=FALSE}
+
+#train model
+nn_caret <- caret::train(delta ~ ., 
+                   data = covid_train_imputed, 
+                   method = "nnet", 
+                   trControl = fitControl,
+                   tuneLength = 3)
+
+nn_caret$bestTune
+head(nn_caret$results)
+plot(nn_caret)
+plot(varImp(nn_caret))
+
+## Make Prediction
+#use the model to predict mpg01 classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  nn_pred = predict(nn_caret, covid_test_imputed[,1:7]),
+  nn_error = (nn_pred != covid_test_imputed$delta)
+)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  as.factor(prediction_error_df$nn_pred),  
+  covid_test_imputed$delta)
+
+#create ROC curve
+nn_proc <- roc(response = as.numeric(prediction_error_df$nn_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Neural_Network',
+  accuracy = caret::confusionMatrix(as.factor(prediction_error_df$nn_pred), covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(as.factor(prediction_error_df$nn_pred), covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(as.factor(prediction_error_df$nn_pred), covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(nn_proc)))
+
+```
+
+### Multilayer Perceptron Network
+
+```{r multi-layer perceptron, message=FALSE, warning=FALSE}
+
+#fit model
+mlp_caret <- caret::train(delta ~ ., 
+                   data = covid_train_imputed, 
+                   method = "mlpML", 
+                   trControl = fitControl,
+                   tuneLength = 5)
+
+mlp_caret$bestTune
+head(mlp_caret$results)
+plot(mlp_caret)
+plot(varImp(mlp_caret))
+
+## Make Prediction
+#use the model to predict mpg01 classification, add it to the test prediction error dataset
+prediction_error_df <- prediction_error_df %>% mutate(
+  mlp_pred = predict(mlp_caret, covid_test_imputed[,1:7]),
+  mlp_error = (mlp_pred != covid_test_imputed$delta)
+)
+
+## You can also see the details of Testing Error by the confusion table, which shows how the errors occur
+caret::confusionMatrix(
+  as.factor(prediction_error_df$mlp_pred),  
+  covid_test_imputed$delta)
+
+#create ROC curve
+mlp_proc <- roc(response = as.numeric(prediction_error_df$mlp_pred), 
+                   predictor = as.numeric(prediction_error_df$covid_test_imputed.delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+
+#add accuracy, sensitivity, specificity
+summary_statistics <- summary_statistics %>% add_row(
+  model = 'Multilayer_Perceptron',
+  accuracy = caret::confusionMatrix(as.factor(prediction_error_df$mlp_pred), covid_test_imputed$delta)$overall[['Accuracy']], 
+  sensitivity = caret::confusionMatrix(as.factor(prediction_error_df$mlp_pred), covid_test_imputed$delta)$byClass[['Sensitivity']],
+  specificity = caret::confusionMatrix(as.factor(prediction_error_df$mlp_pred), covid_test_imputed$delta)$byClass[['Specificity']],
+  auc = as.numeric(auc(mlp_proc)))
+
+```
+
+## Summary Statistics
+
+Output the Summary Statistics of the above models.
+
+```{r summary statistics}
+
+#output summary statistics
+summary_statistics
+
+```
+
+
+```{r model comparison, eval=FALSE, warning=FALSE, include=FALSE}
+# Compare model performances using resample()
+models_compare_caret <- resamples(list(Naive_Bayes = nb_caret, Random_Forest = rf_caret2, GBM = gbm_caret, XGB = xgb_caret, Neural_Net = nn_caret, Multilayer_Perceptron = mlp_caret))
+
+# Summary of the models performances
+summary(models_compare_caret)
+
+# Draw box plots to compare models
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(models_compare_caret$metrics, scales=scales)
+models_compare_caret$values[models_compare_caret$metrics == 'Accuracy']
+
+```
+
+## Variable Impacts
+
+Based on results in the models above, we will analyze Age Group and Medical Conditions more closely, as these are most frequently the highest impact variables.
+```{r variable impacts}
+
+# library(reshape2)
+# covid_train_melt <- melt(covid_train_imputed, id.var = "delta")
+# summary(covid_train_melt)
+
+#see nature of age_group by delta...need to filter... https://stackoverflow.com/questions/38094244/filtering-within-the-summarise-function-of-dplyr
+
+#plot proportion of Delta vs. original by Age Group...can't plot overlapping density plot since non-continuous age group
+covid_train_imputed %>%
+  count(delta, age_group_imp_mix) %>%
+  group_by(delta) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = delta, y = freq)) +
+  geom_point(aes(color = delta), size = 5) +
+  facet_wrap(~age_group_imp_mix) +
+  ylab("Frequency of Variant by Age Group") + 
+  ggtitle("Proportion of Original vs. Delta by Age Group") +
+  theme(plot.title = element_text(hjust = .5))
+
+
+#plot proportion of Delta vs. original by Medical Condition
+covid_train_imputed %>%
+  count(delta, med_imp_mix) %>%
+  group_by(delta) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = delta, y = freq)) +
+  geom_point(aes(color = delta), size = 5) +
+  facet_wrap(~med_imp_mix) +
+  ylab("Frequency of Variant by Medical Condition") + 
+  ggtitle("Proportion of Original vs. Delta by Pre-Existing Medical Condition") +
+  theme(plot.title = element_text(hjust = .5))
+
+
+```
+
+```{r automl, eval=FALSE, include=FALSE}
+
+# Load library
+library(h2o)
+
+# start h2o cluster
+invisible(h2o.init())
+
+# convert data as h2o type
+covid_train_h2o = as.h2o(covid_train_imputed)
+covid_test_h2o = as.h2o(covid_test_imputed)
+
+# set label type
+y = 'delta'
+pred = setdiff(names(covid_train_imputed), y)
+
+# Run AutoML for 20 base models
+aml = h2o.automl(x = pred, y = y,
+                  training_frame = covid_train_h2o,
+                  max_models = 20,
+                  seed = 1,
+                  max_runtime_secs = 500
+                 )
+
+# AutoML Leaderboard
+lb = h2o.get_leaderboard(object = aml, extra_columns = "ALL") #aml@leaderboard
+lb
+aml@leader
+
+# prediction result on test data
+aml_prediction = h2o.predict(aml@leader, covid_test_h2o[,-8]) %>%
+                         as.data.frame()
+
+#get best model
+gbm <- h2o.get_best_model(aml, algorithm = "GBM")
+gbm@parameters
+
+# create a confusion matrix
+caret::confusionMatrix(covid_test_imputed$delta, aml_prediction$predict)
+
+#create ROC curve
+aml_proc <- roc(response = as.numeric(aml_prediction$predict), 
+                   predictor = as.numeric(covid_test_imputed$delta),
+                   smoothed = TRUE,
+                   ci = TRUE, ci.alpha = .95, quiet = TRUE,
+                   plot = TRUE, auc.polygon = TRUE, max.auc.polygon=TRUE, grid=TRUE, print.auc = TRUE, show.thres = TRUE)
+
+#To understand how the ensemble works, let's take a peek inside the Stacked Ensemble "All Models" model.  The "All Models" ensemble is an ensemble of all of the individual models in the AutoML run.  This is often the top performing model on the leaderboard.
+# Get model ids for all models in the AutoML Leaderboard
+model_ids <- as.data.frame(aml@leaderboard$model_id)[,1]
+# Get the "All Models" Stacked Ensemble model
+se <- h2o.getModel(grep("StackedEnsemble_AllModels", model_ids, value = TRUE)[1])
+# Get the Stacked Ensemble metalearner model
+metalearner <- h2o.getModel(se@model$metalearner$name)
+
+#Examine the variable importance of the metalearner (combiner) algorithm in the ensemble.  This shows us how much each base learner is contributing to the ensemble. The AutoML Stacked Ensembles use the default metalearner algorithm (GLM with non-negative weights), so the variable importance of the metalearner is actually the standardized coefficient magnitudes of the GLM.
+h2o.varimp(metalearner)
+h2o.varimp_plot(metalearner)
+
+h2o.explain(aml@leader, covid_test_h2o)
+h2o.varimp_plot(aml@leader)
+h2o.learning_curve_plot(aml@leader)
+
+
+# close h2o connection
+h2o.shutdown(prompt = FALSE)
+
+
+```
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE, include=FALSE}
+#automatically output all your code chunks into one appendix at the end.
+```
