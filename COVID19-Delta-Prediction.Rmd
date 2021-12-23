@@ -257,9 +257,6 @@ covid_wild_delta_1perc[, sex_imp1 := fill_NA(
 #check a sample of results where sex is NA and sex_imp is populated...only 2 rows had enough data to impute...
 covid_wild_delta_1perc[which(is.na(covid_wild_delta_1perc[,sex]) & !is.na(covid_wild_delta_1perc[,sex_imp1]))[1:6],]
 
-#plot the distribution of imputations vs Distribution of initial data? but this doesn't align with pre vs. post imputation count of NA's (1077 vs. 802 NA's) as per the summary below??? 
-# compare_imp(covid_wild_delta_1perc, origin = "sex", target = c("sex_imp1", "sex_imp2", "sex_imp3", "sex_imp_mix"))
-
 #remove the temporary 1-3 estimates to save space
 covid_wild_delta_1perc[,c('sex_imp1', 'sex_imp2', 'sex_imp3') := NULL]
 
@@ -267,7 +264,7 @@ covid_wild_delta_1perc[,c('sex_imp1', 'sex_imp2', 'sex_imp3') := NULL]
 ################
 
 ## IMPUTE AGE GROUP
-#maybe copy same methods as above, but change y and x...use mixed value to predict this?
+#copy same methods as above, but change y and x...use mixed value to predict this
 covid_wild_delta_1perc[, age_group_imp1 := fill_NA(
   x = .SD,
   model = "lda",
@@ -532,16 +529,6 @@ sum(covid_train_imputed$delta == 0)/nrow(covid_train_imputed)
 #delta proportion
 sum(covid_train_imputed$delta == 1)/nrow(covid_train_imputed)
 
-# #melt the data, converting columns to rows
-# library(reshape2)
-# covid_train_melt <- melt(covid_train_imputed, id.var = "delta")
-# 
-# #create a boxplot of each variable split by delta = 0 or 1
-# covid_train_melt %>% ggplot(aes(x=variable, y=value)) + 
-#   geom_boxplot(aes(color = delta)) +
-#   facet_wrap(~variable, scales = "free") +
-#   ylab("Variable Value") + ggtitle("Boxplot of Variable vs. Delta by non-Delta vs. Delta")
-
 #count unique observations (752) / total number of observations to get the percentage of unique observations (0.0098)
 nrow(covid_train_imputed[,1:7] %>% group_by_all %>% count)/nrow(covid_train_imputed)
 
@@ -570,7 +557,7 @@ fitControl <- trainControl(## 5-fold CV
 #fit logistic regression model on variables 3-9...the date is too strong of a predictor because delta vs. non-delta is split by dates in our dataset creation 
 logistic_reg_glm_imputed <- glm(delta ~ ., data = covid_train_imputed, family = binomial)
 
-#use the model to predict mpg01 classification, add it to the test prediction error dataset
+#use the model to predict classification, add it to the test prediction error dataset
 prediction_error_df <- prediction_error_df %>% mutate(
   logistic_reg_pred_imputed = as.factor(ifelse(predict(logistic_reg_glm_imputed, covid_test_imputed[,1:7], type = "response") > .5, 1, 0)),
   logistic_reg_error_imputed = (logistic_reg_pred_imputed != covid_test_imputed$delta)
@@ -600,7 +587,7 @@ summary_statistics <- tibble(
   auc = as.numeric(auc(logreg_proc)) 
   )
   
-#
+#variable importance
 varImp(logistic_reg_glm_imputed) %>% arrange(desc(Overall))
 
 ```
@@ -758,10 +745,6 @@ summary_statistics <- summary_statistics %>% add_row(
 #https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/
 #https://www.kaggle.com/pelkoja/visual-xgboost-tuning-with-caret
 #https://cran.r-project.org/web/packages/xgboost/vignettes/discoverYourData.html#understand-your-dataset-with-xgboost
-# xgb_train_control <- trainControl(
-#   method = "cv",
-#   number = 2
-# )
 
 #fit xgboost
 xgb_caret <- caret::train(delta ~ ., 
@@ -774,12 +757,9 @@ xgb_caret <- caret::train(delta ~ .,
 #https://stackoverflow.com/questions/22200923/different-results-with-formula-and-non-formula-for-caret-training
 xgb_caret$bestTune
 plot(varImp(xgb_caret))
-#has to be numeric http://appliedpredictivemodeling.com/blog/2013/10/23/the-basics-of-encoding-categorical-data-for-predictive-models
-#encoded_matrix <- model.matrix(covid_train_imputed)
 
 
 ## Make Prediction
-#use the model to predict mpg01 classification, add it to the test prediction error dataset
 prediction_error_df <- prediction_error_df %>% mutate(
   xgb_pred = predict(xgb_caret, covid_test_imputed[,1:7]),
   xgb_error = (xgb_pred != covid_test_imputed$delta)
@@ -820,13 +800,13 @@ nn_caret <- caret::train(delta ~ .,
                    trControl = fitControl,
                    tuneLength = 3)
 
+#check key information about model
 nn_caret$bestTune
 head(nn_caret$results)
 plot(nn_caret)
 plot(varImp(nn_caret))
 
 ## Make Prediction
-#use the model to predict mpg01 classification, add it to the test prediction error dataset
 prediction_error_df <- prediction_error_df %>% mutate(
   nn_pred = predict(nn_caret, covid_test_imputed[,1:7]),
   nn_error = (nn_pred != covid_test_imputed$delta)
@@ -866,13 +846,13 @@ mlp_caret <- caret::train(delta ~ .,
                    trControl = fitControl,
                    tuneLength = 5)
 
+#check key information about model
 mlp_caret$bestTune
 head(mlp_caret$results)
 plot(mlp_caret)
 plot(varImp(mlp_caret))
 
 ## Make Prediction
-#use the model to predict mpg01 classification, add it to the test prediction error dataset
 prediction_error_df <- prediction_error_df %>% mutate(
   mlp_pred = predict(mlp_caret, covid_test_imputed[,1:7]),
   mlp_error = (mlp_pred != covid_test_imputed$delta)
@@ -932,11 +912,6 @@ models_compare_caret$values[models_compare_caret$metrics == 'Accuracy']
 Based on results in the models above, we will analyze Age Group and Medical Conditions more closely, as these are most frequently the highest impact variables.
 ```{r variable impacts}
 
-# library(reshape2)
-# covid_train_melt <- melt(covid_train_imputed, id.var = "delta")
-# summary(covid_train_melt)
-
-#see nature of age_group by delta...need to filter... https://stackoverflow.com/questions/38094244/filtering-within-the-summarise-function-of-dplyr
 
 #plot proportion of Delta vs. original by Age Group...can't plot overlapping density plot since non-continuous age group
 covid_train_imputed %>%
