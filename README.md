@@ -11,7 +11,7 @@
 
 **Conclusions**: These machine learning classification models use observed medical and demographic data to predict the variant and infer relationships between the observed data and the variant. These predictions are better than random guessing and help understand who is more susceptible to certain variants. However, there are many false positives and false negatives that make it difficult to trust the results without more context. These analyses and results can be used as a tool for understanding variant spread in the aggregate and inform targeted public messaging, but would have to be one tool among many for guiding macro policy decisions.
 
-## Lessons Learned
+## Key skills being practiced in this project
 There were several skills I wanted to explore, and thus why I chose this dataset. This project tested several
 key data mining and statistical learning skills, including:  
 - **Healthcare Dataset**: I wanted to analyze an interesting healthcare dataset. This COVID-19 dataset was not my first
